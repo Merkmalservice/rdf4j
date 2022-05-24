@@ -66,8 +66,8 @@ public class ServiceLayerTests extends RDF4JSpringTestBase {
 				null));
 	}
 
-    //TODO
-	//@Test
+	// TODO
+	// @Test
 	public void testRollbackOnException() {
 		transactionTemplate.execute(status -> {
 			Artist artist = artService.createArtist("Jan", "Vermeer");
