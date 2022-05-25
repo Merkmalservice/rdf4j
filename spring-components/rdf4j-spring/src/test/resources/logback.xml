@@ -17,7 +17,6 @@
 	<root level="WARN">
 		<appender-ref ref="STDOUT"/>
 	</root>
-	<logger name="org.eclipse.rdf4j.spring" level="DEBUG"/>
+	<logger name="org.eclipse.rdf4j.spring" level="ERROR"/>
 	<logger name="org.springframework" level="ERROR"/>
-    <logger name="org.springframework.transaction.support.AbstractPlatformTransactionManager" level="DEBUG"/>
 </configuration>
