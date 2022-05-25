@@ -325,12 +325,12 @@ public class Expressions {
 		return binaryExpression(BinaryOperator.NOT_EQUALS, left, right);
 	}
 
-	public static Expression<?> notEquals(Variable var, RdfValue... options) {
-		return new NotEquals(var, options);
+	public static Expression<?> notEquals(Variable left, RdfValue right) {
+		return binaryExpression(BinaryOperator.NOT_EQUALS, left, right);
 	}
 
-	public static Expression<?> notEquals(Variable var, IRI... options) {
-		return notEquals(var, parseIRIOptionsToRDFValueVarargs(options));
+	public static Expression<?> notEquals(Variable left, IRI right) {
+		return binaryExpression(BinaryOperator.NOT_EQUALS, left, iri(right));
 	}
 
 	/**
@@ -638,42 +638,6 @@ public class Expressions {
 
 	public static Expression<?> iff(Operand testExp, Operand thenExp, Operand elseExp) {
 		return function(SparqlFunction.IF, testExp, thenExp, elseExp);
-	}
-
-	public static SequencePath seq(PropertyPath left, PropertyPath right) {
-		return new SequencePath(left, right);
-	}
-
-	public static PredicatePath p(Iri predicate) {
-		return new PredicatePath(predicate);
-	}
-
-	public static InversePredicatePath inv(Iri predicate) {
-		return new InversePredicatePath(predicate);
-	}
-
-	public static InversePath inv(PropertyPath path) {
-		return new InversePath(path);
-	}
-
-	public static AlternativePath alt(PropertyPath left, PropertyPath right) {
-		return new AlternativePath(left, right);
-	}
-
-	public static OneOrMorePath oom(PropertyPath path) {
-		return new OneOrMorePath(path);
-	}
-
-	public static GroupedPath group(PropertyPath path) {
-		return new GroupedPath(path);
-	}
-
-	public static PropertyPathBuilder path(IRI property) {
-		return new EmptyPropertyPathBuilder().pred(property);
-	}
-
-	public static EmptyPropertyPathBuilder path() {
-		return new EmptyPropertyPathBuilder();
 	}
 
 	/**
