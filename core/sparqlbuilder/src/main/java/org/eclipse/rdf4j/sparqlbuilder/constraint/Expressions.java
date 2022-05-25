@@ -15,8 +15,15 @@ import static org.eclipse.rdf4j.sparqlbuilder.constraint.SparqlFunction.CEIL;
 import static org.eclipse.rdf4j.sparqlbuilder.constraint.SparqlFunction.COALESCE;
 import static org.eclipse.rdf4j.sparqlbuilder.constraint.SparqlFunction.CONCAT;
 import static org.eclipse.rdf4j.sparqlbuilder.constraint.SparqlFunction.REGEX;
+import static org.eclipse.rdf4j.sparqlbuilder.rdf.Rdf.iri;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import org.eclipse.rdf4j.model.IRI;
+import org.eclipse.rdf4j.sparqlbuilder.constraint.propertypath.*;
+import org.eclipse.rdf4j.sparqlbuilder.constraint.propertypath.builder.EmptyPropertyPathBuilder;
+import org.eclipse.rdf4j.sparqlbuilder.constraint.propertypath.builder.PropertyPathBuilder;
 import org.eclipse.rdf4j.sparqlbuilder.core.Assignable;
 import org.eclipse.rdf4j.sparqlbuilder.core.Variable;
 import org.eclipse.rdf4j.sparqlbuilder.rdf.Iri;
@@ -318,6 +325,14 @@ public class Expressions {
 		return binaryExpression(BinaryOperator.NOT_EQUALS, left, right);
 	}
 
+	public static Expression<?> notEquals(Variable var, RdfValue... options) {
+		return new NotEquals(var, options);
+	}
+
+	public static Expression<?> notEquals(Variable var, IRI... options) {
+		return notEquals(var, parseIRIOptionsToRDFValueVarargs(options));
+	}
+
 	/**
 	 * <code>left > right</code>
 	 *
@@ -593,8 +608,16 @@ public class Expressions {
 		return new NotIn(var, options);
 	}
 
+	public static Expression<?> notIn(Variable var, IRI... options) {
+		return notIn(var, parseIRIOptionsToRDFValueVarargs(options));
+	}
+
 	public static Expression<?> in(Variable var, RdfValue... options) {
 		return new In(var, options);
+	}
+
+	public static Expression<?> in(Variable var, IRI... options) {
+		return in(var, parseIRIOptionsToRDFValueVarargs(options));
 	}
 
 	public static Expression<?> strdt(Operand lexicalForm, Operand datatype) {
@@ -615,5 +638,55 @@ public class Expressions {
 
 	public static Expression<?> iff(Operand testExp, Operand thenExp, Operand elseExp) {
 		return function(SparqlFunction.IF, testExp, thenExp, elseExp);
+	}
+
+	public static SequencePath seq(PropertyPath left, PropertyPath right) {
+		return new SequencePath(left, right);
+	}
+
+	public static PredicatePath p(Iri predicate) {
+		return new PredicatePath(predicate);
+	}
+
+	public static InversePredicatePath inv(Iri predicate) {
+		return new InversePredicatePath(predicate);
+	}
+
+	public static InversePath inv(PropertyPath path) {
+		return new InversePath(path);
+	}
+
+	public static AlternativePath alt(PropertyPath left, PropertyPath right) {
+		return new AlternativePath(left, right);
+	}
+
+	public static OneOrMorePath oom(PropertyPath path) {
+		return new OneOrMorePath(path);
+	}
+
+	public static GroupedPath group(PropertyPath path) {
+		return new GroupedPath(path);
+	}
+
+	public static PropertyPathBuilder path(IRI property) {
+		return new EmptyPropertyPathBuilder().pred(property);
+	}
+
+	public static EmptyPropertyPathBuilder path() {
+		return new EmptyPropertyPathBuilder();
+	}
+
+	/**
+	 * Parses IRI... options to RdfValue... options to give more flexibility in expressions use
+	 * 
+	 * @param options options as IRIs
+	 * @return options as RDFValues
+	 */
+	private static RdfValue[] parseIRIOptionsToRDFValueVarargs(IRI... options) {
+		List<RdfValue> rdfValueOptions = new ArrayList<>();
+		for (IRI option : options) {
+			rdfValueOptions.add(iri(option));
+		}
+		return rdfValueOptions.toArray(new RdfValue[0]);
 	}
 }
