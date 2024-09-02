@@ -41,7 +41,7 @@ import org.eclipse.rdf4j.spring.tx.exception.WriteDeniedException;
  */
 public class TransactionalRepositoryConnection extends RepositoryConnectionWrapper {
 
-	TransactionObject transactionObject = null;
+	private transient boolean readonly;
 
 	public TransactionalRepositoryConnection(Repository repository) {
 		super(repository);
@@ -49,15 +49,18 @@ public class TransactionalRepositoryConnection extends RepositoryConnectionWrapp
 
 	public TransactionalRepositoryConnection(Repository repository, RepositoryConnection delegate) {
 		super(repository, delegate);
-		this.transactionObject = transactionObject;
 	}
 
-	public void setTransactionObject(TransactionObject transactionObject) {
-		this.transactionObject = transactionObject;
+	public boolean isReadonly() {
+		return readonly;
+	}
+
+	public void setReadonly(boolean readonly) {
+		this.readonly = readonly;
 	}
 
 	private void throwExceptionIfReadonly() {
-		if (this.transactionObject.isReadOnly()) {
+		if (this.readonly) {
 			throw new WriteDeniedException("Cannot write in a read-only transaction!");
 		}
 	}

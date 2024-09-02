@@ -127,7 +127,6 @@ public class TransactionalRepositoryConnectionFactory implements RepositoryConne
 		transactionData.set(txObj);
 		TransactionalRepositoryConnection txCon = findWrapper(wrappedCon, TransactionalRepositoryConnection.class)
 				.get();
-		txCon.setTransactionObject(txObj);
 		logger.debug("Transaction created");
 		return txObj;
 	}

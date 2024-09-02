@@ -71,6 +71,7 @@ public class RDF4JRepositoryTransactionManager extends AbstractPlatformTransacti
 		data.setIsolationLevel(transactionDefinition.getIsolationLevel());
 		data.setPropagationBehavior(transactionDefinition.getPropagationBehavior());
 		data.setReadOnly(transactionDefinition.isReadOnly());
+		((TransactionalRepositoryConnection) data.getConnection()).setReadonly(transactionDefinition.isReadOnly());
 		data.setName(Thread.currentThread().getName() + " " + transactionDefinition.getName());
 		setIsolationLevel(data, transactionDefinition);
 	}
