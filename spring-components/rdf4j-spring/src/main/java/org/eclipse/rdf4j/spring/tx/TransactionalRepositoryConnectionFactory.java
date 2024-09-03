@@ -44,11 +44,11 @@ public class TransactionalRepositoryConnectionFactory implements RepositoryConne
 		this.delegateFactory = delegateFactory;
 	}
 
-	public TransactionObject getTransactionData() {
+	public synchronized TransactionObject getTransactionData() {
 		return transactionData.get();
 	}
 
-	public RepositoryConnection getConnection() {
+	public synchronized RepositoryConnection getConnection() {
 		logger.debug("Trying to obtain connection");
 		TransactionObject data = getTransactionData();
 		if (data == null) {
@@ -76,7 +76,7 @@ public class TransactionalRepositoryConnectionFactory implements RepositoryConne
 		return con;
 	}
 
-	public void closeConnection() {
+	public synchronized void closeConnection() {
 		logger.debug("Trying to close connection");
 		RepositoryConnection con = null;
 		try {
@@ -116,7 +116,7 @@ public class TransactionalRepositoryConnectionFactory implements RepositoryConne
 		}
 	}
 
-	public TransactionObject createTransaction() {
+	public synchronized TransactionObject createTransaction() {
 		logger.debug("Trying to create new transaction");
 		RepositoryConnection delegate = delegateFactory.getConnection();
 		RepositoryConnection wrappedCon = wrapOnce(
@@ -131,7 +131,7 @@ public class TransactionalRepositoryConnectionFactory implements RepositoryConne
 		return txObj;
 	}
 
-	public void endTransaction(boolean rollback) {
+	public synchronized void endTransaction(boolean rollback) {
 		logger.debug("Trying to end transaction");
 		TransactionObject data = getTransactionData();
 		if (data == null) {
