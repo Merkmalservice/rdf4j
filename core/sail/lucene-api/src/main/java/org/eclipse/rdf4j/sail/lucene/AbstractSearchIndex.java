@@ -32,6 +32,7 @@ import org.eclipse.rdf4j.model.Literal;
 import org.eclipse.rdf4j.model.Resource;
 import org.eclipse.rdf4j.model.Statement;
 import org.eclipse.rdf4j.model.ValueFactory;
+import org.eclipse.rdf4j.model.base.CoreDatatype;
 import org.eclipse.rdf4j.model.impl.BooleanLiteral;
 import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
 import org.eclipse.rdf4j.model.vocabulary.GEO;
@@ -41,9 +42,13 @@ import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.MalformedQueryException;
 import org.eclipse.rdf4j.query.algebra.Var;
 import org.eclipse.rdf4j.query.algebra.evaluation.QueryBindingSet;
+import org.eclipse.rdf4j.query.algebra.evaluation.function.geosparql.SpatialAlgebra;
+import org.eclipse.rdf4j.query.algebra.evaluation.function.geosparql.SpatialSupport;
+import org.eclipse.rdf4j.sail.Sail;
 import org.eclipse.rdf4j.sail.SailException;
 import org.eclipse.rdf4j.sail.lucene.util.MapOfListMaps;
 import org.locationtech.spatial4j.context.SpatialContext;
+import org.locationtech.spatial4j.io.ShapeReader;
 import org.locationtech.spatial4j.shape.Point;
 import org.locationtech.spatial4j.shape.Shape;
 import org.slf4j.Logger;
@@ -65,7 +70,8 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 		REJECTED_DATATYPES.add("http://www.w3.org/2001/XMLSchema#float");
 	}
 
-	protected int maxDocs;
+	protected int defaultNumDocs = -1;
+	protected int maxDocs = Integer.MAX_VALUE;
 
 	protected Set<String> wktFields = Collections.singleton(SearchFields.getPropertyField(GEO.AS_WKT));
 
@@ -75,8 +81,29 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 
 	@Override
 	public void initialize(Properties parameters) throws Exception {
-		String maxDocParam = parameters.getProperty(LuceneSail.MAX_DOCUMENTS_KEY);
-		maxDocs = (maxDocParam != null) ? Integer.parseInt(maxDocParam) : -1;
+		String maxDocumentsParam = parameters.getProperty(LuceneSail.MAX_DOCUMENTS_KEY);
+		String defaultNumDocsParam = parameters.getProperty(LuceneSail.DEFAULT_NUM_DOCS_KEY);
+
+		if ((maxDocumentsParam != null)) {
+			maxDocs = Integer.parseInt(maxDocumentsParam);
+
+			// if maxDocs is set then defaultNumDocs is set to maxDocs if it is not set, because we now have a known
+			// upper limit
+			defaultNumDocs = (defaultNumDocsParam != null) ? Math.min(maxDocs, Integer.parseInt(defaultNumDocsParam))
+					: maxDocs;
+		} else {
+			// we can never return more than Integer.MAX_VALUE documents
+			maxDocs = Integer.MAX_VALUE;
+
+			// legacy behaviour is to return the number of documents that the query would return if there was no limit,
+			// so if the defaultNumDocs is not set, we set it to -1 to signal that there is no limit
+			defaultNumDocs = (defaultNumDocsParam != null) ? Integer.parseInt(defaultNumDocsParam) : -1;
+		}
+
+		if (defaultNumDocs > maxDocs) {
+			throw new IllegalArgumentException(LuceneSail.DEFAULT_NUM_DOCS_KEY + " must be less than or equal to "
+					+ LuceneSail.MAX_DOCUMENTS_KEY + " (" + defaultNumDocs + " > " + maxDocs + ")");
+		}
 
 		String wktFieldParam = parameters.getProperty(LuceneSail.WKT_FIELDS);
 		if (wktFieldParam != null) {
@@ -146,7 +173,7 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 
 		// we reject literals that aren't in the list of the indexed lang
 		if (indexedLangs != null
-				&& (!literal.getLanguage().isPresent()
+				&& (literal.getLanguage().isEmpty()
 						|| !indexedLangs.contains(literal.getLanguage().get().toLowerCase()
 						))) {
 			return false;
@@ -353,11 +380,8 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 									// remove value from both property field and the
 									// corresponding text field
 									String field = SearchFields.getPropertyField(r.getPredicate());
-									Set<String> removedValues = removedOfResource.get(field);
-									if (removedValues == null) {
-										removedValues = new HashSet<>();
-										removedOfResource.put(field, removedValues);
-									}
+									Set<String> removedValues = removedOfResource.computeIfAbsent(field,
+											k -> new HashSet<>());
 									removedValues.add(val);
 								}
 							}
@@ -545,7 +569,8 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 				hits = query(query.getSubject(), query);
 			}
 		} catch (Exception e) {
-			logger.error("There was a problem evaluating query '" + query.getCatQuery() + "'!", e);
+			logger.error("There was a problem evaluating query '{}'!", query.getCatQuery(), e);
+			assert false : "There was a problem evaluating query '" + query.getCatQuery() + "'!";
 		}
 
 		return hits;
@@ -717,6 +742,8 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 		} catch (Exception e) {
 			logger.error("There was a problem evaluating distance query 'within " + distance + getUnitSymbol(units)
 					+ " of " + from.getLabel() + "'!", e);
+			assert false : "There was a problem evaluating distance query 'within " + distance + getUnitSymbol(units)
+					+ " of " + from.getLabel() + "'!";
 		}
 
 		return hits;
@@ -825,9 +852,64 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 		} catch (Exception e) {
 			logger.error("There was a problem evaluating spatial relation query '" + query.getRelation() + " "
 					+ qgeom.getLabel() + "'!", e);
+			assert false : "There was a problem evaluating spatial relation query '" + query.getRelation() + " "
+					+ qgeom.getLabel() + "'!";
 		}
 
 		return hits;
+	}
+
+	private IRI toSpatialOp(String relation) {
+		if (GEOF.SF_INTERSECTS.stringValue().equals(relation)) {
+			return GEOF.SF_INTERSECTS;
+		} else if (GEOF.SF_DISJOINT.stringValue().equals(relation)) {
+			return GEOF.SF_DISJOINT;
+		} else if (GEOF.SF_EQUALS.stringValue().equals(relation)) {
+			return GEOF.SF_EQUALS;
+		} else if (GEOF.SF_OVERLAPS.stringValue().equals(relation)) {
+			return GEOF.SF_OVERLAPS;
+		} else if (GEOF.EH_COVERED_BY.stringValue().equals(relation)) {
+			return GEOF.SF_WITHIN;
+		} else if (GEOF.EH_COVERS.stringValue().equals(relation)) {
+			return GEOF.EH_CONTAINS;
+		} else if (GEOF.SF_WITHIN.stringValue().equals(relation)) {
+			return GEOF.SF_WITHIN;
+		} else if (GEOF.EH_CONTAINS.stringValue().equals(relation)) {
+			return GEOF.EH_CONTAINS;
+		}
+		return null;
+	}
+
+	private Shape readShape(String geo) {
+		ShapeReader reader = SpatialSupport.getSpatialContext().getFormats().getWktReader();
+		try {
+			return reader.read(geo);
+		} catch (IOException | ParseException e) {
+			throw new SailException("Can't read geo wkt shape", e);
+		}
+	}
+
+	private boolean checkSpatialOp(IRI op, Shape arg1, Shape arg2) {
+		SpatialAlgebra algebra = SpatialSupport.getSpatialAlgebra();
+		if (op == GEOF.SF_INTERSECTS) {
+			return algebra.sfIntersects(arg1, arg2);
+		}
+		if (op == GEOF.SF_DISJOINT) {
+			return algebra.sfDisjoint(arg1, arg2);
+		}
+		if (op == GEOF.SF_EQUALS) {
+			return algebra.sfEquals(arg1, arg2);
+		}
+		if (op == GEOF.SF_OVERLAPS) {
+			return algebra.sfOverlaps(arg1, arg2);
+		}
+		if (op == GEOF.SF_WITHIN) {
+			return algebra.sfWithin(arg1, arg2);
+		}
+		if (op == GEOF.EH_CONTAINS) {
+			return algebra.ehContains(arg1, arg2);
+		} else
+			throw new SailException(new IllegalArgumentException("bad spatial op : " + op));
 	}
 
 	private BindingSetCollection generateBindingSets(GeoRelationQuerySpec query,
@@ -868,8 +950,25 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 				}
 
 				List<String> geometries = doc.getProperty(SearchFields.getPropertyField(query.getGeoProperty()));
+				boolean needValidation = geometries.size() != 1;
+				IRI spatialOp = null;
+				Shape funcGeo = null;
+				if (needValidation) {
+					spatialOp = toSpatialOp(query.getRelation());
+					funcGeo = readShape(query.getQueryGeometry().getLabel());
+				}
 				for (String geometry : geometries) {
 					QueryBindingSet derivedBindings = new QueryBindingSet();
+					if (geoVar != null) {
+						if (needValidation && spatialOp != null) {
+							Shape geo = readShape(geometry);
+
+							if (!checkSpatialOp(spatialOp, funcGeo, geo)) {
+								continue; // not inside the asked shape
+							}
+						}
+						derivedBindings.addBinding(geoVar, SearchFields.wktToLiteral(geometry));
+					}
 					if (subjVar != null) {
 						Resource resource = getResource(doc);
 						derivedBindings.addBinding(subjVar, resource);
@@ -879,9 +978,6 @@ public abstract class AbstractSearchIndex implements SearchIndex {
 						if (ctx != null) {
 							derivedBindings.addBinding(contextVar.getName(), ctx);
 						}
-					}
-					if (geoVar != null) {
-						derivedBindings.addBinding(geoVar, SearchFields.wktToLiteral(geometry));
 					}
 					if (fVar != null) {
 						derivedBindings.addBinding(fVar, BooleanLiteral.TRUE);

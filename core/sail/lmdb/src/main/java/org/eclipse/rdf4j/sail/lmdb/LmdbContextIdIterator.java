@@ -23,8 +23,8 @@ import static org.lwjgl.util.lmdb.LMDB.mdb_cursor_renew;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.concurrent.locks.StampedLock;
 
+import org.eclipse.rdf4j.common.concurrent.locks.StampedLongAdderLockManager;
 import org.eclipse.rdf4j.sail.SailException;
 import org.eclipse.rdf4j.sail.lmdb.TxnManager.Txn;
 import org.lwjgl.PointerBuffer;
@@ -61,20 +61,25 @@ class LmdbContextIdIterator implements Closeable {
 
 	private boolean fetchNext = false;
 
-	private final StampedLock txnLock;
+	private final StampedLongAdderLockManager txnLockManager;
 
 	private final Thread ownerThread = Thread.currentThread();
 
-	LmdbContextIdIterator(Pool pool, int dbi, Txn txnRef) throws IOException {
-		this.pool = pool;
+	LmdbContextIdIterator(int dbi, Txn txnRef) throws IOException {
+		this.pool = Pool.get();
 		this.keyData = pool.getVal();
 		this.valueData = pool.getVal();
 
 		this.dbi = dbi;
 		this.txnRef = txnRef;
-		this.txnLock = txnRef.lock();
+		this.txnLockManager = txnRef.lockManager();
 
-		long stamp = txnLock.readLock();
+		long readStamp;
+		try {
+			readStamp = txnLockManager.readLock();
+		} catch (InterruptedException e) {
+			throw new SailException(e);
+		}
 		try {
 			this.txnRefVersion = txnRef.version();
 			this.txn = txnRef.get();
@@ -85,12 +90,17 @@ class LmdbContextIdIterator implements Closeable {
 				cursor = pp.get(0);
 			}
 		} finally {
-			txnLock.unlockRead(stamp);
+			txnLockManager.unlockRead(readStamp);
 		}
 	}
 
 	public long[] next() {
-		long stamp = txnLock.readLock();
+		long readStamp;
+		try {
+			readStamp = txnLockManager.readLock();
+		} catch (InterruptedException e) {
+			throw new SailException(e);
+		}
 		try {
 			if (txnRefVersion != txnRef.version()) {
 				// cursor must be renewed
@@ -104,12 +114,12 @@ class LmdbContextIdIterator implements Closeable {
 					Varint.writeUnsigned(minKeyBuf, record[0]);
 					minKeyBuf.flip();
 					keyData.mv_data(minKeyBuf);
-					lastResult = E(mdb_cursor_get(cursor, keyData, valueData, MDB_SET));
-					if (lastResult != 0) {
+					lastResult = mdb_cursor_get(cursor, keyData, valueData, MDB_SET);
+					if (lastResult != MDB_SUCCESS) {
 						// use MDB_SET_RANGE if key was deleted
-						lastResult = E(mdb_cursor_get(cursor, keyData, valueData, MDB_SET_RANGE));
+						lastResult = mdb_cursor_get(cursor, keyData, valueData, MDB_SET_RANGE);
 					}
-					if (lastResult != 0) {
+					if (lastResult != MDB_SUCCESS) {
 						closeInternal(false);
 						return null;
 					}
@@ -119,16 +129,16 @@ class LmdbContextIdIterator implements Closeable {
 			}
 
 			if (fetchNext) {
-				lastResult = E(mdb_cursor_get(cursor, keyData, valueData, MDB_NEXT));
+				lastResult = mdb_cursor_get(cursor, keyData, valueData, MDB_NEXT);
 				fetchNext = false;
 			} else {
 				if (minKeyBuf != null) {
 					// set cursor to min key
 					keyData.mv_data(minKeyBuf);
-					lastResult = E(mdb_cursor_get(cursor, keyData, valueData, MDB_SET_RANGE));
+					lastResult = mdb_cursor_get(cursor, keyData, valueData, MDB_SET_RANGE);
 				} else {
 					// set cursor to first item
-					lastResult = E(mdb_cursor_get(cursor, keyData, valueData, MDB_NEXT));
+					lastResult = mdb_cursor_get(cursor, keyData, valueData, MDB_NEXT);
 				}
 			}
 
@@ -143,17 +153,21 @@ class LmdbContextIdIterator implements Closeable {
 		} catch (IOException e) {
 			throw new SailException(e);
 		} finally {
-			txnLock.unlockRead(stamp);
+			txnLockManager.unlockRead(readStamp);
 		}
 	}
 
 	private void closeInternal(boolean maybeCalledAsync) {
 		if (!closed) {
-			long stamp;
+			long writeStamp = 0L;
+			boolean writeLocked = false;
 			if (maybeCalledAsync && ownerThread != Thread.currentThread()) {
-				stamp = txnLock.writeLock();
-			} else {
-				stamp = 0;
+				try {
+					writeStamp = txnLockManager.writeLock();
+					writeLocked = true;
+				} catch (InterruptedException e) {
+					throw new SailException(e);
+				}
 			}
 			try {
 				if (!closed) {
@@ -166,8 +180,8 @@ class LmdbContextIdIterator implements Closeable {
 				}
 			} finally {
 				closed = true;
-				if (stamp != 0) {
-					txnLock.unlockWrite(stamp);
+				if (writeLocked) {
+					txnLockManager.unlockWrite(writeStamp);
 				}
 			}
 		}

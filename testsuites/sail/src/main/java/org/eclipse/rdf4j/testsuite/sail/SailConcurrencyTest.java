@@ -36,7 +36,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -155,6 +157,7 @@ public abstract class SailConcurrencyTest {
 	 * @see <a href="https://github.com/eclipse/rdf4j/issues/693">https://github.com/eclipse/rdf4j/issues/693</a>
 	 */
 	@Test
+	@Timeout(value = 30, unit = TimeUnit.MINUTES)
 	public void testConcurrentAddLargeTxn() throws Exception {
 		logger.info("executing two large concurrent transactions");
 		final CountDownLatch runnersDone = new CountDownLatch(2);
@@ -196,6 +199,7 @@ public abstract class SailConcurrencyTest {
 	 * one of the transactions rolls back at the end.
 	 */
 	@Test
+	@Timeout(value = 30, unit = TimeUnit.MINUTES)
 	public void testConcurrentAddLargeTxnRollback() throws Exception {
 		logger.info("executing two large concurrent transactions");
 		final CountDownLatch runnersDone = new CountDownLatch(2);
@@ -237,6 +241,7 @@ public abstract class SailConcurrencyTest {
 	}
 
 	@Test
+	@Timeout(value = 30, unit = TimeUnit.MINUTES)
 	@Disabled("This test takes a long time and accomplishes little extra")
 	public void testGetContextIDs() throws Exception {
 		// Create one thread which writes statements to the repository, on a
@@ -314,7 +319,9 @@ public abstract class SailConcurrencyTest {
 	}
 
 	@Test
+	@Timeout(value = 30, unit = TimeUnit.MINUTES)
 	public void testConcurrentConnectionsShutdown() throws InterruptedException {
+		System.err.println("Running testConcurrentConnectionsShutdown");
 		if (store instanceof AbstractSail) {
 			((AbstractSail) store).setConnectionTimeOut(200);
 		} else if (store instanceof SailWrapper) {
@@ -356,8 +363,93 @@ public abstract class SailConcurrencyTest {
 
 	}
 
+	// @Disabled
 	@Test
+	@Timeout(value = 30, unit = TimeUnit.MINUTES)
+	public void testSerialThreads() throws InterruptedException {
+		System.err.println("Running testSerialThreads");
+		if (store instanceof AbstractSail) {
+			((AbstractSail) store).setConnectionTimeOut(200);
+		} else if (store instanceof SailWrapper) {
+			Sail baseSail = ((SailWrapper) store).getBaseSail();
+			if (baseSail instanceof AbstractSail) {
+				((AbstractSail) baseSail).setConnectionTimeOut(200);
+			}
+		}
+
+		try (SailConnection connection = store.getConnection()) {
+			connection.begin();
+			connection.addStatement(RDF.TYPE, RDF.TYPE, RDF.PROPERTY, RDF.TYPE);
+			connection.commit();
+		}
+
+		AtomicReference<SailConnection> connection1 = new AtomicReference<>();
+
+		Thread thread1 = new Thread(() -> {
+			SailConnection connection = store.getConnection();
+			connection1.setRelease(connection);
+
+		});
+
+		thread1.start();
+		thread1.join();
+
+		thread1 = new Thread(() -> {
+			SailConnection connection = connection1.getAcquire();
+			connection.begin(IsolationLevels.NONE);
+		});
+
+		thread1.start();
+		thread1.join();
+
+		thread1 = new Thread(() -> {
+			SailConnection connection = connection1.getAcquire();
+			connection.addStatement(RDF.FIRST, RDF.TYPE, RDF.PROPERTY);
+		});
+
+		thread1.start();
+		thread1.join();
+
+		thread1 = new Thread(() -> {
+			SailConnection connection = connection1.getAcquire();
+			connection.clear(RDF.TYPE);
+		});
+
+		thread1.start();
+		thread1.join();
+
+		thread1 = new Thread(() -> {
+			SailConnection connection = connection1.getAcquire();
+			connection.commit();
+		});
+
+		thread1.start();
+		thread1.join();
+
+		thread1 = new Thread(() -> {
+			SailConnection connection = connection1.getAcquire();
+			connection.close();
+		});
+
+		thread1.start();
+		thread1.join();
+
+		try (SailConnection connection = store.getConnection()) {
+			connection.begin();
+			long size = connection.size();
+			assertEquals(1, size);
+			connection.clear();
+			connection.commit();
+		}
+
+		store.shutDown();
+
+	}
+
+	@Test
+	@Timeout(value = 30, unit = TimeUnit.MINUTES)
 	public void testConcurrentConnectionsShutdownReadCommitted() throws InterruptedException {
+		System.err.println("Running testConcurrentConnectionsShutdownReadCommitted");
 		if (store instanceof AbstractSail) {
 			((AbstractSail) store).setConnectionTimeOut(200);
 		} else if (store instanceof SailWrapper) {
@@ -411,8 +503,11 @@ public abstract class SailConcurrencyTest {
 
 	}
 
-	@Test
+//	@Test
+	@RepeatedTest(5)
+	@Timeout(value = 30, unit = TimeUnit.MINUTES)
 	public void testConcurrentConnectionsShutdownAndClose() throws InterruptedException {
+		System.err.println("Running testConcurrentConnectionsShutdownAndClose");
 		if (store instanceof AbstractSail) {
 			((AbstractSail) store).setConnectionTimeOut(200);
 		}
@@ -433,8 +528,6 @@ public abstract class SailConcurrencyTest {
 			connection1.get().begin(IsolationLevels.NONE);
 			connection1.get().clear();
 		});
-		thread1.setName("Thread 1");
-		thread1.start();
 
 		CountDownLatch countDownLatch2 = new CountDownLatch(1);
 		Thread thread2 = new Thread(() -> {
@@ -445,6 +538,8 @@ public abstract class SailConcurrencyTest {
 
 		});
 		thread2.setName("Thread 2");
+		thread1.setName("Thread 1");
+		thread1.start();
 		thread2.start();
 
 		countDownLatch1.await();
@@ -472,11 +567,24 @@ public abstract class SailConcurrencyTest {
 			assertThat(size).isLessThanOrEqualTo(1);
 		}
 
+		try (SailConnection connection = store.getConnection()) {
+			connection.begin();
+			connection.addStatement(RDF.TYPE, RDF.TYPE, RDF.PROPERTY);
+			connection.commit();
+		}
+		try (SailConnection connection = store.getConnection()) {
+			connection.begin();
+			connection.clear();
+			connection.commit();
+		}
+
 		store.shutDown();
 	}
 
 	@Test
+	@Timeout(value = 30, unit = TimeUnit.MINUTES)
 	public void testConcurrentConnectionsShutdownAndCloseRollback() throws InterruptedException {
+		System.err.println("Running testConcurrentConnectionsShutdownAndCloseRollback");
 		if (store instanceof AbstractSail) {
 			((AbstractSail) store).setConnectionTimeOut(200);
 		}

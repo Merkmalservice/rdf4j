@@ -12,6 +12,7 @@ package org.eclipse.rdf4j.sail.lmdb;
 
 import static org.eclipse.rdf4j.sail.lmdb.LmdbUtil.E;
 import static org.lwjgl.system.MemoryUtil.NULL;
+import static org.lwjgl.util.lmdb.LMDB.MDB_MAP_FULL;
 import static org.lwjgl.util.lmdb.LMDB.MDB_NEXT;
 import static org.lwjgl.util.lmdb.LMDB.MDB_NOOVERWRITE;
 import static org.lwjgl.util.lmdb.LMDB.MDB_SET;
@@ -24,6 +25,7 @@ import static org.lwjgl.util.lmdb.LMDB.mdb_cursor_renew;
 import static org.lwjgl.util.lmdb.LMDB.mdb_del;
 import static org.lwjgl.util.lmdb.LMDB.mdb_drop;
 import static org.lwjgl.util.lmdb.LMDB.mdb_put;
+import static org.lwjgl.util.lmdb.LMDB.mdb_strerror;
 import static org.lwjgl.util.lmdb.LMDB.mdb_txn_abort;
 import static org.lwjgl.util.lmdb.LMDB.mdb_txn_begin;
 
@@ -37,17 +39,22 @@ import java.nio.ByteBuffer;
 import java.util.AbstractSet;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
-import java.util.concurrent.locks.StampedLock;
 
+import org.eclipse.rdf4j.common.concurrent.locks.StampedLongAdderLockManager;
+import org.eclipse.rdf4j.sail.SailException;
 import org.eclipse.rdf4j.sail.lmdb.TxnManager.Txn;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.util.lmdb.MDBVal;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A LMDB-based persistent set.
  */
 class PersistentSet<T extends Serializable> extends AbstractSet<T> {
+
+	private static final Logger logger = LoggerFactory.getLogger(PersistentSet.class);
 
 	private PersistentSetFactory<T> factory;
 	private final int dbi;
@@ -106,7 +113,7 @@ class PersistentSet<T extends Serializable> extends AbstractSet<T> {
 		}
 	}
 
-	private synchronized boolean update(Object element, boolean add) throws IOException {
+	private synchronized boolean update(Object element, boolean add) throws IOException, InterruptedException {
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			if (factory.writeTxn == 0) {
 				// start a write transaction
@@ -126,15 +133,35 @@ class PersistentSet<T extends Serializable> extends AbstractSet<T> {
 			keyVal.mv_data(keyBuf);
 
 			if (add) {
-				if (E(mdb_put(factory.writeTxn, dbi, keyVal, dataVal, MDB_NOOVERWRITE)) == MDB_SUCCESS) {
+				int rc = mdb_put(factory.writeTxn, dbi, keyVal, dataVal, MDB_NOOVERWRITE);
+				if (rc == MDB_SUCCESS) {
 					size++;
 					return true;
+				} else if (rc == MDB_MAP_FULL) {
+					factory.ensureResize();
+					if (mdb_put(factory.writeTxn, dbi, keyVal, dataVal, MDB_NOOVERWRITE) == MDB_SUCCESS) {
+						size++;
+						return true;
+					}
+					return false;
+				} else {
+					logger.debug("Failed to add element due to error {}: {}", mdb_strerror(rc), element);
 				}
 			} else {
 				// delete element
-				if (mdb_del(factory.writeTxn, dbi, keyVal, dataVal) == MDB_SUCCESS) {
+				int rc = mdb_del(factory.writeTxn, dbi, keyVal, dataVal);
+				if (rc == MDB_SUCCESS) {
 					size--;
 					return true;
+				} else if (rc == MDB_MAP_FULL) {
+					factory.ensureResize();
+					if (mdb_del(factory.writeTxn, dbi, keyVal, dataVal) == MDB_SUCCESS) {
+						size--;
+						return true;
+					}
+					return false;
+				} else {
+					logger.debug("Failed to remove element due to error {}: {}", mdb_strerror(rc), element);
 				}
 			}
 			return false;
@@ -163,7 +190,7 @@ class PersistentSet<T extends Serializable> extends AbstractSet<T> {
 		private final MDBVal valueData = MDBVal.malloc();
 		private final long cursor;
 
-		private final StampedLock txnLock;
+		private final StampedLongAdderLockManager txnLockManager;
 		private Txn txnRef;
 		private long txnRefVersion;
 
@@ -173,9 +200,9 @@ class PersistentSet<T extends Serializable> extends AbstractSet<T> {
 		private ElementIterator(int dbi) {
 			try {
 				this.txnRef = factory.txnManager.createReadTxn();
-				this.txnLock = txnRef.lock();
+				this.txnLockManager = txnRef.lockManager();
 
-				long stamp = txnLock.readLock();
+				long readStamp = txnLockManager.readLock();
 				try {
 					this.txnRefVersion = txnRef.version();
 
@@ -185,7 +212,7 @@ class PersistentSet<T extends Serializable> extends AbstractSet<T> {
 						cursor = pp.get(0);
 					}
 				} finally {
-					txnLock.unlockRead(stamp);
+					txnLockManager.unlockRead(readStamp);
 				}
 			} catch (Exception e) {
 				throw new RuntimeException(e);
@@ -217,8 +244,8 @@ class PersistentSet<T extends Serializable> extends AbstractSet<T> {
 			return current;
 		}
 
-		private T computeNext() throws IOException {
-			long stamp = txnLock.readLock();
+		private T computeNext() throws IOException, InterruptedException {
+			long readStamp = txnLockManager.readLock();
 			try {
 				if (txnRefVersion != txnRef.version()) {
 					// cursor must be renewed
@@ -241,7 +268,7 @@ class PersistentSet<T extends Serializable> extends AbstractSet<T> {
 				close();
 				return null;
 			} finally {
-				txnLock.unlockRead(stamp);
+				txnLockManager.unlockRead(readStamp);
 			}
 		}
 
@@ -249,13 +276,18 @@ class PersistentSet<T extends Serializable> extends AbstractSet<T> {
 			if (txnRef != null) {
 				keyData.close();
 				valueData.close();
-				long stamp = txnLock.readLock();
+				long readStamp;
+				try {
+					readStamp = txnLockManager.readLock();
+				} catch (InterruptedException e) {
+					throw new SailException(e);
+				}
 				try {
 					mdb_cursor_close(cursor);
 					txnRef.close();
 					txnRef = null;
 				} finally {
-					txnLock.unlockRead(stamp);
+					txnLockManager.unlockRead(readStamp);
 				}
 			}
 		}

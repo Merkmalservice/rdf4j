@@ -24,6 +24,8 @@ import org.eclipse.rdf4j.model.Literal;
 import org.eclipse.rdf4j.model.Statement;
 import org.eclipse.rdf4j.model.util.Values;
 import org.eclipse.rdf4j.model.vocabulary.DCTERMS;
+import org.eclipse.rdf4j.model.vocabulary.FOAF;
+import org.eclipse.rdf4j.model.vocabulary.RDF;
 import org.eclipse.rdf4j.model.vocabulary.RDFS;
 import org.eclipse.rdf4j.query.AbstractTupleQueryResultHandler;
 import org.eclipse.rdf4j.query.BindingSet;
@@ -35,6 +37,7 @@ import org.eclipse.rdf4j.query.TupleQuery;
 import org.eclipse.rdf4j.query.TupleQueryResult;
 import org.eclipse.rdf4j.query.TupleQueryResultHandlerException;
 import org.eclipse.rdf4j.query.impl.SimpleDataset;
+import org.eclipse.rdf4j.repository.Repository;
 import org.eclipse.rdf4j.repository.RepositoryConnection;
 import org.eclipse.rdf4j.repository.util.Repositories;
 import org.junit.jupiter.api.Assertions;
@@ -134,6 +137,61 @@ public class BasicTests extends SPARQLBaseTest {
 		/* test query with bind clause */
 		prepareTest(Arrays.asList("/tests/basic/data01endpoint1.ttl", "/tests/basic/data01endpoint2.ttl"));
 		execute("/tests/basic/query_bind.rq", "/tests/basic/query_bind.srx", false, true);
+	}
+
+	@Test
+	public void testRepositoryConnectionApi() throws Exception {
+
+		prepareTest(
+				Arrays.asList("/tests/basic/data_emptyStore.ttl", "/tests/basic/data_emptyStore.ttl"));
+
+		Repository repo1 = getRepository(1);
+		Repository repo2 = getRepository(2);
+
+		IRI bob = Values.iri("http://example.org/bob");
+		IRI alice = Values.iri("http://example.org/alice");
+		IRI graph1 = Values.iri("http://example.org/graph1");
+		IRI graph2 = Values.iri("http://example.org/graph2");
+
+		try (RepositoryConnection conn = repo1.getConnection()) {
+			conn.add(bob, RDF.TYPE, FOAF.PERSON, graph1);
+			conn.add(bob, FOAF.NAME, Values.literal("Bob"), graph1);
+		}
+
+		try (RepositoryConnection conn = repo2.getConnection()) {
+			conn.add(alice, RDF.TYPE, FOAF.PERSON, graph2);
+			conn.add(alice, FOAF.NAME, Values.literal("Alice"), graph2);
+		}
+
+		var fedxRepo = fedxRule.getRepository();
+
+		try (var conn = fedxRepo.getConnection()) {
+
+			// hasStatement which exist
+			Assertions.assertTrue(conn.hasStatement(bob, RDF.TYPE, FOAF.PERSON, false));
+			Assertions.assertTrue(conn.hasStatement(bob, RDF.TYPE, FOAF.PERSON, false, graph1));
+			Assertions.assertTrue(conn.hasStatement(null, RDF.TYPE, FOAF.PERSON, false));
+			Assertions.assertTrue(conn.hasStatement(null, RDF.TYPE, FOAF.PERSON, false, graph1));
+			Assertions.assertTrue(conn.hasStatement(null, RDF.TYPE, null, false));
+			Assertions.assertTrue(conn.hasStatement(null, RDF.TYPE, null, false, graph1));
+			Assertions.assertTrue(conn.hasStatement(null, RDF.TYPE, null, false, graph2));
+			Assertions.assertTrue(conn.hasStatement(null, null, null, false));
+			Assertions.assertTrue(conn.hasStatement(null, null, null, false, graph1));
+
+			// hasStatement which do not exist
+			Assertions.assertFalse(conn.hasStatement(bob, RDF.TYPE, FOAF.ORGANIZATION, false));
+			Assertions.assertFalse(conn.hasStatement(bob, RDF.TYPE, FOAF.PERSON, false, graph2));
+
+			// getStatements
+			Assertions.assertEquals(Set.of(bob, alice),
+					QueryResults.asModel(conn.getStatements(null, RDF.TYPE, FOAF.PERSON, false)).subjects());
+			Assertions.assertEquals(Set.of(bob),
+					QueryResults.asModel(conn.getStatements(null, RDF.TYPE, FOAF.PERSON, false, graph1)).subjects());
+			Assertions.assertEquals(Set.of(bob, alice),
+					QueryResults.asModel(conn.getStatements(null, null, null, false)).subjects());
+			Assertions.assertEquals(Set.of(bob),
+					QueryResults.asModel(conn.getStatements(null, null, null, false, graph1)).subjects());
+		}
 	}
 
 	@Test
@@ -572,6 +630,85 @@ public class BasicTests extends SPARQLBaseTest {
 					Assertions.assertFalse(tqr.hasNext(), "Result is expected to have a single result");
 				}
 			}
+		}
+
+	}
+
+	@Test
+	public void test_reduceFederation() throws Exception {
+
+		List<Endpoint> endpoints = prepareTest(
+				Arrays.asList("/tests/basic/data_emptyStore.ttl", "/tests/basic/data_emptyStore.ttl"));
+
+		Repository repo1 = getRepository(1);
+		Repository repo2 = getRepository(2);
+
+		String repo1Id = endpoints.get(0).getId();
+
+		IRI graph1 = Values.iri("http://example.org/graph1");
+		IRI graph2 = Values.iri("http://example.org/graph2");
+
+		try (RepositoryConnection con = repo1.getConnection()) {
+			con.add(Values.iri("http://example.org/repo1/p1"), RDF.TYPE, FOAF.PERSON, graph1);
+			con.add(Values.iri("http://example.org/repo2/p2"), RDF.TYPE, FOAF.PERSON, graph2);
+		}
+
+		try (RepositoryConnection con = repo2.getConnection()) {
+			con.add(Values.iri("http://example.org/repo2/p3"), RDF.TYPE, FOAF.PERSON, graph1);
+		}
+
+		Repository fedxRepo = fedxRule.getRepository();
+
+		// 1: regular federation
+		try (RepositoryConnection con = fedxRepo.getConnection()) {
+			TupleQuery tupleQuery = con.prepareTupleQuery(
+					"PREFIX foaf: <http://xmlns.com/foaf/0.1/> "
+							+ "SELECT * WHERE { "
+							+ "   ?subClass a foaf:Person. "
+							+ " } "
+			);
+
+			// expect from both repos
+			Assertions.assertEquals(3, QueryResults.asSet(tupleQuery.evaluate()).size());
+
+			// now we scope it additional to graph1
+			tupleQuery = con.prepareTupleQuery(
+					"PREFIX foaf: <http://xmlns.com/foaf/0.1/> "
+							+ "SELECT * FROM <http://example.org/graph1> WHERE { "
+							+ "   ?subClass a foaf:Person. "
+							+ " } ");
+
+			// expect results defined in graph1 (1 in repo1, 2 from repo2)
+			Assertions.assertEquals(2, QueryResults.asSet(tupleQuery.evaluate()).size());
+		}
+
+		// 2: reduce to federation member 1 id
+		// 2a: additionall restrict to named graph
+		FedXDataset fedXDataset = new FedXDataset(new SimpleDataset());
+		fedXDataset.addEndpoint(repo1Id);
+
+		try (RepositoryConnection con = fedxRepo.getConnection()) {
+			TupleQuery tupleQuery = con.prepareTupleQuery(
+					"PREFIX foaf: <http://xmlns.com/foaf/0.1/> "
+							+ "SELECT * WHERE { "
+							+ "   ?subClass a foaf:Person. "
+							+ " } "
+			);
+			tupleQuery.setDataset(fedXDataset);
+
+			// expect result from repo 1
+			Assertions.assertEquals(2, QueryResults.asSet(tupleQuery.evaluate()).size());
+
+			// now we scope it additional to graph1
+			tupleQuery = con.prepareTupleQuery(
+					"PREFIX foaf: <http://xmlns.com/foaf/0.1/> "
+							+ "SELECT * FROM <http://example.org/graph1> WHERE { "
+							+ "   ?subClass a foaf:Person. "
+							+ " } ");
+			tupleQuery.setDataset(fedXDataset);
+
+			// expect result from graph1 from repo1
+			Assertions.assertEquals(1, QueryResults.asSet(tupleQuery.evaluate()).size());
 		}
 
 	}

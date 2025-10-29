@@ -11,6 +11,7 @@
 package org.eclipse.rdf4j.sail.shacl.ast.planNodes;
 
 import java.util.ArrayDeque;
+import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -25,20 +26,32 @@ import org.eclipse.rdf4j.query.algebra.BindingSetAssignment;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
 import org.eclipse.rdf4j.query.algebra.helpers.AbstractSimpleQueryModelVisitor;
 import org.eclipse.rdf4j.query.impl.EmptyBindingSet;
+import org.eclipse.rdf4j.sail.InterruptedSailException;
 import org.eclipse.rdf4j.sail.SailConnection;
+import org.eclipse.rdf4j.sail.SailException;
 import org.eclipse.rdf4j.sail.shacl.ast.SparqlQueryParserCache;
+import org.eclipse.rdf4j.sail.shacl.ast.StatementMatcher;
 import org.eclipse.rdf4j.sail.shacl.ast.constraintcomponents.AbstractConstraintComponent;
 
 public abstract class AbstractBulkJoinPlanNode implements PlanNode {
 
+	public static final List<StatementMatcher.Variable> DEFAULT_VARS = List.of(new StatementMatcher.Variable("a"),
+			new StatementMatcher.Variable("c"));
 	public static final String BINDING_NAME = "a";
 	protected static final int BULK_SIZE = 1000;
-	private StackTraceElement[] stackTrace;
+	private final List<StatementMatcher.Variable> vars;
+	private final String varsQueryString;
+	StackTraceElement[] stackTrace;
 	protected Function<BindingSet, ValidationTuple> mapper;
 	ValidationExecutionLogger validationExecutionLogger;
 
-	public AbstractBulkJoinPlanNode() {
-//		this.stackTrace = Thread.currentThread().getStackTrace();
+	public AbstractBulkJoinPlanNode(List<StatementMatcher.Variable> vars) {
+		this.vars = vars;
+		this.varsQueryString = vars.stream()
+				.map(StatementMatcher.Variable::asSparqlVariable)
+				.reduce((a, b) -> a + " " + b)
+				.orElseThrow();
+		this.stackTrace = Thread.currentThread().getStackTrace();
 	}
 
 	TupleExpr parseQuery(String query) {
@@ -46,11 +59,12 @@ public abstract class AbstractBulkJoinPlanNode implements PlanNode {
 		// #VALUES_INJECTION_POINT# is an annotation in the query where there is a "new scope" due to the bottom up
 		// semantics of SPARQL but where we don't actually want a new scope.
 		query = query.replace(AbstractConstraintComponent.VALUES_INJECTION_POINT, "\nVALUES (?a) {}\n");
-		String completeQuery = "select * where {\nVALUES (?a) {}\n" + query + "\n}";
+
+		String completeQuery = "select distinct " + varsQueryString + " where {\nVALUES (?a) {}\n" + query + "\n}";
 		return SparqlQueryParserCache.get(completeQuery);
 	}
 
-	void runQuery(ArrayDeque<ValidationTuple> left, ArrayDeque<ValidationTuple> right, SailConnection connection,
+	void runQuery(Collection<ValidationTuple> left, ArrayDeque<ValidationTuple> right, SailConnection connection,
 			TupleExpr parsedQuery, Dataset dataset, Resource[] dataGraph, boolean skipBasedOnPreviousConnection,
 			SailConnection previousStateConnection) {
 		List<BindingSet> newBindindingSet = buildBindingSets(left, connection, skipBasedOnPreviousConnection,
@@ -58,6 +72,10 @@ public abstract class AbstractBulkJoinPlanNode implements PlanNode {
 
 		if (!newBindindingSet.isEmpty()) {
 			updateQuery(parsedQuery, newBindindingSet);
+			if (Thread.currentThread().isInterrupted()) {
+				Thread.currentThread().interrupt();
+				throw new InterruptedSailException();
+			}
 			executeQuery(right, connection, dataset, parsedQuery);
 		}
 	}
@@ -92,7 +110,7 @@ public abstract class AbstractBulkJoinPlanNode implements PlanNode {
 				});
 	}
 
-	private List<BindingSet> buildBindingSets(ArrayDeque<ValidationTuple> left, SailConnection connection,
+	private List<BindingSet> buildBindingSets(Collection<ValidationTuple> left, SailConnection connection,
 			boolean skipBasedOnPreviousConnection, SailConnection previousStateConnection, Resource[] dataGraph) {
 		return left.stream()
 
@@ -102,6 +120,16 @@ public abstract class AbstractBulkJoinPlanNode implements PlanNode {
 					}
 
 					boolean hasStatement;
+
+					if (Thread.currentThread().isInterrupted()) {
+						Thread.currentThread().interrupt();
+						throw new InterruptedSailException(
+								"Thread was interrupted while checking previous state connection.");
+					}
+
+					if (!(connection.isOpen() && connection.isActive())) {
+						throw new SailException("Connection is not active");
+					}
 
 					if (!(tuple.getActiveTarget().isResource())) {
 						hasStatement = previousStateConnection.hasStatement(null, null, tuple.getActiveTarget(),

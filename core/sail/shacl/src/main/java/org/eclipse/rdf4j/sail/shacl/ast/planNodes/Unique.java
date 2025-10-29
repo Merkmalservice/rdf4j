@@ -24,6 +24,7 @@ import org.eclipse.rdf4j.query.algebra.evaluation.util.ValueComparator;
 import org.eclipse.rdf4j.sail.SailException;
 import org.eclipse.rdf4j.sail.shacl.ast.constraintcomponents.ConstraintComponent;
 import org.eclipse.rdf4j.sail.shacl.wrapper.data.CloseablePeakableIteration;
+import org.eclipse.rdf4j.sail.shacl.wrapper.data.ConnectionsGroup;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -39,9 +40,9 @@ public class Unique implements PlanNode {
 	private boolean printed = false;
 	private ValidationExecutionLogger validationExecutionLogger;
 
-	private Unique(PlanNode parent, boolean compress) {
+	private Unique(PlanNode parent, boolean compress, ConnectionsGroup connectionsGroup) {
 //		this.stackTrace = Thread.currentThread().getStackTrace();
-		PlanNode tempParent = PlanNodeHelper.handleSorting(this, parent);
+		PlanNode tempParent = PlanNodeHelper.handleSorting(this, parent, connectionsGroup);
 
 		if (tempParent instanceof Unique) {
 			Unique parentUnique = ((Unique) tempParent);
@@ -57,11 +58,16 @@ public class Unique implements PlanNode {
 		this.compress = compress;
 	}
 
-	public static PlanNode getInstance(PlanNode parent, boolean compress) {
+	public static PlanNode getInstance(PlanNode parent, boolean compress, ConnectionsGroup connectionsGroup) {
 		if (parent.isGuaranteedEmpty()) {
 			return parent;
 		}
-		return new Unique(parent, compress);
+
+		if (parent instanceof Unique && (!compress || ((Unique) parent).compress == compress)) {
+			return parent;
+		}
+
+		return new Unique(parent, compress, connectionsGroup);
 	}
 
 	@Override
@@ -106,6 +112,8 @@ public class Unique implements PlanNode {
 						Set<ValidationTuple> tuples = new HashSet<>();
 
 						if (propertyShapeWithValue) {
+							if (parentIterator.hasNext())
+								parentIterator.peek();
 
 							while (parentIterator.hasNext()
 									&& parentIterator.peek().getValue().equals(temp.getValue())
@@ -177,6 +185,14 @@ public class Unique implements PlanNode {
 
 			@Override
 			protected boolean localHasNext() {
+				if (isClosed()) {
+					return false;
+				}
+				if (Thread.currentThread().isInterrupted()) {
+					close();
+					return false;
+				}
+
 				calculateNext();
 				return next != null;
 			}
@@ -253,7 +269,6 @@ public class Unique implements PlanNode {
 	public String toString() {
 		return "Unique{" +
 				"compress=" + compress +
-				", parent=" + parent +
 				'}';
 	}
 

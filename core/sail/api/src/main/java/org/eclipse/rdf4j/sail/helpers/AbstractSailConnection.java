@@ -19,11 +19,13 @@ import java.util.IdentityHashMap;
 import java.util.LinkedList;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
-import java.util.concurrent.locks.ReentrantLock;
 
+import org.eclipse.rdf4j.common.annotation.Experimental;
 import org.eclipse.rdf4j.common.annotation.InternalUseOnly;
+import org.eclipse.rdf4j.common.concurrent.locks.ExclusiveReentrantLockManager;
 import org.eclipse.rdf4j.common.concurrent.locks.Lock;
 import org.eclipse.rdf4j.common.concurrent.locks.diagnostics.ConcurrentCleaner;
 import org.eclipse.rdf4j.common.iteration.CloseableIteration;
@@ -41,6 +43,7 @@ import org.eclipse.rdf4j.model.impl.SimpleValueFactory;
 import org.eclipse.rdf4j.query.BindingSet;
 import org.eclipse.rdf4j.query.Dataset;
 import org.eclipse.rdf4j.query.algebra.TupleExpr;
+import org.eclipse.rdf4j.sail.InterruptedSailException;
 import org.eclipse.rdf4j.sail.SailConnection;
 import org.eclipse.rdf4j.sail.SailException;
 import org.eclipse.rdf4j.sail.UnknownSailTransactionStateException;
@@ -94,20 +97,20 @@ public abstract class AbstractSailConnection implements SailConnection {
 	 */
 	private final LongAdder blockClose = new LongAdder();
 	private final LongAdder unblockClose = new LongAdder();
+	private final AtomicReference<Thread> activeThread = new AtomicReference<>();
 
 	@SuppressWarnings("FieldMayBeFinal")
 	private boolean isOpen = true;
 	private static final VarHandle IS_OPEN;
 
-	private Thread owner;
+	private final Thread owner;
 
 	/**
 	 * Lock used to prevent concurrent calls to update methods like addStatement, clear, commit, etc. within a
 	 * transaction.
-	 *
 	 */
-	private final ReentrantLock updateLock = new ReentrantLock();
-
+	private final ExclusiveReentrantLockManager updateLock = new ExclusiveReentrantLockManager(
+			"AbstractSailConnection-updateLock");
 	private final LongAdder iterationsOpened = new LongAdder();
 	private final LongAdder iterationsClosed = new LongAdder();
 
@@ -196,9 +199,11 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 
-			updateLock.lock();
+			Lock exclusiveLock = updateLock.getExclusiveLock();
 			try {
 				if (isActive()) {
 					throw new SailException("a transaction is already active on this connection.");
@@ -207,10 +212,18 @@ public abstract class AbstractSailConnection implements SailConnection {
 				startTransactionInternal();
 				txnActive = true;
 			} finally {
-				updateLock.unlock();
+				exclusiveLock.release();
 			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new InterruptedSailException(e);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
+
 		}
 		startUpdate(null);
 	}
@@ -231,105 +244,81 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 	@Override
 	public final void close() throws SailException {
-		Thread deadlockPreventionThread = startDeadlockPreventionThread();
 
 		// obtain an exclusive lock so that any further operations on this
 		// connection (including those from any concurrent threads) are blocked.
 		if (!IS_OPEN.compareAndSet(this, true, false)) {
 			return;
 		}
+
 		try {
-
-			while (true) {
-				long sumDone = unblockClose.sum();
-				long sumBlocking = blockClose.sum();
-				if (sumDone == sumBlocking) {
-					break;
-				} else {
-					if (Thread.currentThread().isInterrupted()) {
-						throw new SailException(
-								"Connection was interrupted while waiting on active operations before it could be closed.");
-					} else {
-						LockSupport.parkNanos(Duration.ofMillis(10).toNanos());
-					}
-				}
-			}
-
-			try {
-				forceCloseActiveOperations();
-
-				if (txnActive) {
-					logger.warn("Rolling back transaction due to connection close",
-							debugEnabled ? new Throwable() : null);
-					try {
-						// Use internal method to avoid deadlock: the public
-						// rollback method will try to obtain a connection lock
-						rollbackInternal();
-					} finally {
-						txnActive = false;
-						txnPrepared = false;
-					}
-				}
-
-				closeInternal();
-
-				if (isActiveOperation()) {
-					throw new SailException("Connection closed before all iterations were closed.");
-				}
-			} finally {
-				sailBase.connectionClosed(this);
-			}
+			sailBase.connectionClosed(this);
 		} finally {
-			if (deadlockPreventionThread != null) {
-				deadlockPreventionThread.interrupt();
+			try {
+				waitForOtherOperations(true);
+			} finally {
+				try {
+					forceCloseActiveOperations();
+				} finally {
+					if (txnActive) {
+						logger.warn("Rolling back transaction due to connection close",
+								debugEnabled ? new Throwable() : null);
+						try {
+							// Use internal method to avoid deadlock: the public
+							// rollback method will try to obtain a connection lock
+							rollbackInternal();
+						} finally {
+							txnActive = false;
+							txnPrepared = false;
+						}
+					}
+
+					closeInternal();
+
+					if (isActiveOperation()) {
+						throw new SailException("Connection closed before all iterations were closed.");
+					}
+				}
 			}
 		}
 
 	}
 
-	/**
-	 * If the current thread is not the owner, starts a thread to handle potential deadlocks by interrupting the owner.
-	 *
-	 * @return The started deadlock prevention thread or null if the current thread is the owner.
-	 */
-	private Thread startDeadlockPreventionThread() {
-		Thread deadlockPreventionThread = null;
-
-		if (Thread.currentThread() != owner) {
-
-			if (logger.isInfoEnabled()) {
-				// use info level for this because FedX prevalently closes connections from different threads
-				logger.info(
-						"Closing connection from a different thread than the one that opened it. Connections should not be shared between threads. Opened by {} closed by {}",
-						owner, Thread.currentThread(), new Throwable("Throwable used for stacktrace"));
-			}
-
-			deadlockPreventionThread = new Thread(() -> {
-				try {
-					// This thread should sleep for a while so that the callee has a chance to finish.
-					// The callee will interrupt this thread when it is finished, which means that there were no
-					// deadlocks and we can exit.
-					Thread.sleep(sailBase.connectionTimeOut / 2);
-
-					owner.interrupt();
-					// wait for up to 1 second for the owner thread to die
-					owner.join(1000);
-					if (owner.isAlive()) {
-						logger.error("Interrupted thread {} but thread is still alive after 1000 ms!", owner);
-					}
-
-				} catch (InterruptedException ignored) {
-					// this thread is interrupted as a signal that there were no deadlocks, so the exception can be
-					// ignored and we can simply exit
+	@InternalUseOnly
+	public void waitForOtherOperations(boolean interrupt) {
+		int i = 0;
+		boolean interrupted = false;
+		while (true) {
+			long sumDone = unblockClose.sum();
+			long sumBlocking = blockClose.sum();
+			if (sumDone == sumBlocking) {
+				if (interrupted) {
+					logger.warn(
+							"Connection is no longer blocked by concurrent operation after interrupting the active thread");
 				}
-
-			});
-
-			deadlockPreventionThread.setDaemon(true);
-			deadlockPreventionThread.start();
-
+				break;
+			} else {
+				if (Thread.currentThread().isInterrupted()) {
+					throw new SailException(
+							"Connection was interrupted while waiting on concurrent operations before it could be closed.");
+				} else {
+					LockSupport.parkNanos(Duration.ofMillis(10).toNanos());
+					if (++i % 500 == 0) { // wait for 5 seconds before logging and interrupting
+						Thread acquire = activeThread.getAcquire();
+						if (acquire != null) {
+							logger.warn("Connection is blocked by concurrent operation in thread: {}", acquire);
+							if (interrupt) {
+								acquire.interrupt();
+								interrupted = true;
+								logger.error(
+										"Connection is blocked by concurrent operation in thread {} which was interrupted to attempt to forcefully abort the concurrent operation.",
+										acquire);
+							}
+						}
+					}
+				}
+			}
 		}
-		return deadlockPreventionThread;
 	}
 
 	@Override
@@ -339,6 +328,8 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 			CloseableIteration<? extends BindingSet> iteration = null;
 			try {
@@ -354,7 +345,11 @@ public abstract class AbstractSailConnection implements SailConnection {
 				throw t;
 			}
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -364,10 +359,16 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 			return registerIteration(getContextIDsInternal());
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -378,6 +379,7 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
 			verifyIsOpen();
 			CloseableIteration<? extends Statement> iteration = null;
 			try {
@@ -390,7 +392,11 @@ public abstract class AbstractSailConnection implements SailConnection {
 				throw t;
 			}
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -424,10 +430,15 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
 			verifyIsOpen();
 			return hasStatementInternal(subj, pred, obj, includeInferred, contexts);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 
 	}
@@ -445,10 +456,15 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
 			verifyIsOpen();
 			return sizeInternal(contexts);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -489,19 +505,27 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
 			verifyIsOpen();
 
-			updateLock.lock();
+			Lock exclusiveLock = updateLock.getExclusiveLock();
 			try {
 				if (txnActive) {
 					prepareInternal();
 					txnPrepared = true;
 				}
 			} finally {
-				updateLock.unlock();
+				exclusiveLock.release();
 			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new InterruptedSailException(e);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -513,9 +537,11 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 
-			updateLock.lock();
+			Lock exclusiveLock = updateLock.getExclusiveLock();
 			try {
 				if (txnActive) {
 					if (!txnPrepared) {
@@ -526,10 +552,17 @@ public abstract class AbstractSailConnection implements SailConnection {
 					txnPrepared = false;
 				}
 			} finally {
-				updateLock.unlock();
+				exclusiveLock.release();
 			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new InterruptedSailException(e);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -544,13 +577,44 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
-			verifyIsOpen();
+			activeThread.setRelease(Thread.currentThread());
 
-			updateLock.lock();
+			verifyIsOpen();
+			Lock exclusiveLock = null;
+			InterruptedException exception = null;
+			try {
+				exclusiveLock = updateLock.getExclusiveLock();
+
+			} catch (InterruptedException e) {
+				// we really want to finish rolling back, so we retry getting the lock even if we've been interrupted
+				logger.warn(
+						"Interrupted while trying to acquire exclusive lock to rollback transaction. Retrying one time.",
+						e);
+				exception = e;
+				try {
+					exclusiveLock = updateLock.getExclusiveLock();
+
+				} catch (InterruptedException e2) {
+					assert false
+							: "Interrupted a second time while trying to acquire exclusive lock to rollback transaction. This should never happen during testing";
+					logger.error(
+							"Interrupted a second time while trying to acquire exclusive lock to rollback transaction. Giving up.",
+							e2);
+					Thread.currentThread().interrupt();
+					throw new InterruptedSailException(
+							"Interrupted twice while trying to acquire exclusive lock to rollback transaction.", e);
+				}
+			}
 			try {
 				if (txnActive) {
 					try {
 						rollbackInternal();
+						if (exception != null) {
+							Thread.currentThread().interrupt();
+							throw new InterruptedSailException(
+									"Interrupted while acquiring lock to allow for rollback. Retried lock and rolled back transaction successfully. Re-interrupted and re-threw exception.",
+									exception);
+						}
 					} finally {
 						txnActive = false;
 						txnPrepared = false;
@@ -560,10 +624,16 @@ public abstract class AbstractSailConnection implements SailConnection {
 							debugEnabled ? new Throwable() : null);
 				}
 			} finally {
-				updateLock.unlock();
+				if (exclusiveLock != null) {
+					exclusiveLock.release();
+				}
 			}
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -660,18 +730,26 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 
-			updateLock.lock();
+			Lock exclusiveLock = updateLock.getExclusiveLock();
 			try {
 				verifyIsActive();
 				endUpdateInternal(op);
 			} finally {
-				updateLock.unlock();
+				exclusiveLock.release();
 			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new InterruptedSailException(e);
 		} finally {
-			unblockClose.increment();
-
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 			if (op != null) {
 				flush();
 			}
@@ -698,10 +776,8 @@ public abstract class AbstractSailConnection implements SailConnection {
 		synchronized (added) {
 			model = added.remove(op);
 		}
-		if (model != null) {
-			for (Statement st : model) {
-				addStatementInternal(st.getSubject(), st.getPredicate(), st.getObject(), st.getContext());
-			}
+		if (model != null && !model.isEmpty()) {
+			bulkAddStatementsInternal(model);
 		}
 	}
 
@@ -711,30 +787,43 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 
-			updateLock.lock();
+			Lock exclusiveLock = updateLock.getExclusiveLock();
 			try {
 				verifyIsActive();
 				clearInternal(contexts);
 				statementsRemoved = true;
 			} finally {
-				updateLock.unlock();
+				exclusiveLock.release();
 			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new InterruptedSailException(e);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
 	@Override
 	public final CloseableIteration<? extends Namespace> getNamespaces() throws SailException {
-
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
 			verifyIsOpen();
 			return registerIteration(getNamespacesInternal());
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -745,11 +834,18 @@ public abstract class AbstractSailConnection implements SailConnection {
 		}
 
 		blockClose.increment();
+
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 			return getNamespaceInternal(prefix);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -764,17 +860,27 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 
-			updateLock.lock();
+			Lock exclusiveLock = updateLock.getExclusiveLock();
+
 			try {
 				verifyIsActive();
 				setNamespaceInternal(prefix, name);
 			} finally {
-				updateLock.unlock();
+				exclusiveLock.release();
 			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new InterruptedSailException(e);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -786,17 +892,27 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 
-			updateLock.lock();
+			Lock exclusiveLock = updateLock.getExclusiveLock();
+
 			try {
 				verifyIsActive();
 				removeNamespaceInternal(prefix);
 			} finally {
-				updateLock.unlock();
+				exclusiveLock.release();
 			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new InterruptedSailException(e);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 		}
 	}
 
@@ -805,17 +921,27 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		blockClose.increment();
 		try {
+			activeThread.setRelease(Thread.currentThread());
+
 			verifyIsOpen();
 
-			updateLock.lock();
+			Lock exclusiveLock = updateLock.getExclusiveLock();
+
 			try {
 				verifyIsActive();
 				clearNamespacesInternal();
 			} finally {
-				updateLock.unlock();
+				exclusiveLock.release();
 			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new InterruptedSailException(e);
 		} finally {
-			unblockClose.increment();
+			try {
+				activeThread.setRelease(null);
+			} finally {
+				unblockClose.increment();
+			}
 
 		}
 	}
@@ -855,7 +981,8 @@ public abstract class AbstractSailConnection implements SailConnection {
 
 		if (debugEnabled) {
 			var result = new SailBaseIteration<>(iter, this);
-			activeIterationsDebug.put(result, new Throwable("Unclosed iteration"));
+			activeIterationsDebug.put(result,
+					new Throwable("Unclosed iteration created in " + this.getClass().getName()));
 			return result;
 		} else {
 			return new CleanerIteration<>(new SailBaseIteration<>(iter, this), cleaner);
@@ -903,6 +1030,14 @@ public abstract class AbstractSailConnection implements SailConnection {
 	protected abstract void addStatementInternal(Resource subj, IRI pred, Value obj, Resource... contexts)
 			throws SailException;
 
+	@Experimental
+	protected void bulkAddStatementsInternal(final Collection<? extends Statement> statements)
+			throws SailException {
+		for (final Statement st : statements) {
+			addStatementInternal(st.getSubject(), st.getPredicate(), st.getObject(), st.getContext());
+		}
+	}
+
 	protected abstract void removeStatementsInternal(Resource subj, IRI pred, Value obj, Resource... contexts)
 			throws SailException;
 
@@ -925,52 +1060,52 @@ public abstract class AbstractSailConnection implements SailConnection {
 		return closed != opened;
 	}
 
+	@InternalUseOnly
+	public boolean hasActiveIterations() {
+		long closed = iterationsClosed.sum();
+		long opened = iterationsOpened.sum();
+		return closed != opened;
+	}
+
 	protected AbstractSail getSailBase() {
 		return sailBase;
 	}
 
 	private void forceCloseActiveOperations() throws SailException {
-		Thread deadlockPreventionThread = startDeadlockPreventionThread();
-		try {
-			for (int i = 0; i < 10 && isActiveOperation() && !debugEnabled; i++) {
-				System.gc();
-				try {
-					Thread.sleep(1);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					throw new SailException(e);
-				}
+		for (int i = 0; i < 10 && isActiveOperation() && !debugEnabled; i++) {
+			System.gc();
+			try {
+				Thread.sleep(1);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				throw new InterruptedSailException(e);
 			}
+		}
 
-			if (debugEnabled) {
+		if (debugEnabled) {
 
-				var activeIterationsCopy = new IdentityHashMap<>(activeIterationsDebug);
-				activeIterationsDebug.clear();
+			var activeIterationsCopy = new IdentityHashMap<>(activeIterationsDebug);
+			activeIterationsDebug.clear();
 
-				if (!activeIterationsCopy.isEmpty()) {
-					for (var entry : activeIterationsCopy.entrySet()) {
-						try {
-							logger.warn("Unclosed iteration", entry.getValue());
-							entry.getKey().close();
-						} catch (Exception e) {
-							if (e instanceof InterruptedException) {
-								Thread.currentThread().interrupt();
-								throw new SailException(e);
-							}
-							logger.warn("Exception occurred while closing unclosed iterations.", e);
+			if (!activeIterationsCopy.isEmpty()) {
+				for (var entry : activeIterationsCopy.entrySet()) {
+					try {
+						logger.warn("Unclosed iteration", entry.getValue());
+						entry.getKey().close();
+					} catch (Exception e) {
+						if (e instanceof InterruptedException) {
+							Thread.currentThread().interrupt();
+							throw new InterruptedSailException(e);
 						}
+						logger.warn("Exception occurred while closing unclosed iterations.", e);
 					}
-
-					var entry = activeIterationsCopy.entrySet().stream().findAny().orElseThrow();
-
-					throw new SailException(
-							"Connection closed before all iterations were closed: " + entry.getKey().toString(),
-							entry.getValue());
 				}
-			}
-		} finally {
-			if (deadlockPreventionThread != null) {
-				deadlockPreventionThread.interrupt();
+
+				var entry = activeIterationsCopy.entrySet().stream().findAny().orElseThrow();
+
+				throw new SailException(
+						"Connection closed before all iterations were closed: " + entry.getKey().toString(),
+						entry.getValue());
 			}
 		}
 

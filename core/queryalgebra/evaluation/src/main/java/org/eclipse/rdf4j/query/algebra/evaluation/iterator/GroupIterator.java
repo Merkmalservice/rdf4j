@@ -30,6 +30,7 @@ import org.eclipse.rdf4j.collection.factory.api.BindingSetKey;
 import org.eclipse.rdf4j.collection.factory.api.CollectionFactory;
 import org.eclipse.rdf4j.collection.factory.impl.DefaultCollectionFactory;
 import org.eclipse.rdf4j.common.iteration.AbstractCloseableIteratorIteration;
+import org.eclipse.rdf4j.common.iteration.CloseableIteration;
 import org.eclipse.rdf4j.common.transaction.QueryEvaluationMode;
 import org.eclipse.rdf4j.model.Literal;
 import org.eclipse.rdf4j.model.Value;
@@ -89,6 +90,9 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 
 	private final QueryEvaluationStep arguments;
 
+	// The iteration of the arguments, stored while building entries for allowing premature closing
+	private volatile CloseableIteration<BindingSet> argumentsIter;
+
 	private final ValueFactory vf;
 
 	private final CollectionFactory cf;
@@ -129,7 +133,13 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 
 	@Override
 	public void handleClose() throws QueryEvaluationException {
-		cf.close();
+		try {
+			cf.close();
+		} finally {
+			var iter = argumentsIter;
+			if (iter != null)
+				iter.close();
+		}
 	}
 
 	@Override
@@ -256,42 +266,46 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 
 	private Collection<Entry> buildEntries(List<AggregatePredicateCollectorSupplier<?, ?>> aggregates)
 			throws QueryEvaluationException {
-		try (var iter = arguments.evaluate(parentBindings)) {
+		// store the arguments' iterator so it can be closed while building entries
+		this.argumentsIter = arguments.evaluate(parentBindings);
+		try (var iter = argumentsIter) {
+			if (!iter.hasNext()) {
+				return emptySolutionSpecialCase(aggregates);
+			}
+
 			List<Function<BindingSet, Value>> getValues = group.getGroupBindingNames()
 					.stream()
 					.map(n -> context.getValue(n))
 					.collect(Collectors.toList());
 
-			if (!iter.hasNext()) {
-				return emptySolutionSpecialCase(aggregates);
-			} else {
-				// TODO: this is an in memory map with no backing into any disk form.
-				// Fixing this requires separating the computation of the aggregates and their
-				// distinct sets if needed from the intermediary values.
+			// TODO: this is an in memory map with no backing into any disk form.
+			// Fixing this requires separating the computation of the aggregates and their
+			// distinct sets if needed from the intermediary values.
 
-				Map<BindingSetKey, Entry> entries = cf.createGroupByMap();
-				// Make an optimized hash function valid during this query evaluation step.
-				ToIntFunction<BindingSet> hashMaker = cf.hashOfBindingSetFuntion(getValues);
-				while (iter.hasNext()) {
-					BindingSet sol = iter.next();
-					// The binding set key will be constant
-					BindingSetKey key = cf.createBindingSetKey(sol, getValues, hashMaker);
-					Entry entry = entries.get(key);
-					if (entry == null) {
-						List<AggregateCollector> collectors = makeCollectors(aggregates);
-						List<Predicate<?>> predicates = new ArrayList<>(aggregates.size());
-						for (AggregatePredicateCollectorSupplier<?, ?> a : aggregates) {
-							predicates.add(a.makePotentialDistinctTest.get());
-						}
-
-						entry = new Entry(sol, collectors, predicates);
-						entries.put(key, entry);
+			Map<BindingSetKey, Entry> entries = cf.createGroupByMap();
+			// Make an optimized hash function valid during this query evaluation step.
+			ToIntFunction<BindingSet> hashMaker = cf.hashOfBindingSetFuntion(getValues);
+			while (!isClosed() && iter.hasNext()) {
+				BindingSet sol = iter.next();
+				// The binding set key will be constant
+				BindingSetKey key = cf.createBindingSetKey(sol, getValues, hashMaker);
+				Entry entry = entries.get(key);
+				if (entry == null) {
+					List<AggregateCollector> collectors = makeCollectors(aggregates);
+					List<Predicate<?>> predicates = new ArrayList<>(aggregates.size());
+					for (AggregatePredicateCollectorSupplier<?, ?> a : aggregates) {
+						predicates.add(a.makePotentialDistinctTest.get());
 					}
 
-					entry.addSolution(sol, aggregates);
+					entry = new Entry(sol, collectors, predicates);
+					entries.put(key, entry);
 				}
-				return entries.values();
+
+				entry.addSolution(sol, aggregates);
 			}
+			return entries.values();
+		} finally {
+			this.argumentsIter = null;
 		}
 	}
 
@@ -305,8 +319,17 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 			} else {
 				List<AggregateCollector> collectors = makeCollectors(aggregates);
 				List<Predicate<?>> predicates = new ArrayList<>(aggregates.size());
-				for (int i = 0; i < aggregates.size(); i++) {
-					predicates.add(ALWAYS_TRUE_BINDING_SET);
+				for (var ag : aggregates) {
+					if (ag.agg instanceof WildCardCountAggregate) {
+						predicates.add(ALWAYS_TRUE_BINDING_SET);
+					} else if (ag.agg instanceof CountAggregate) {
+						// Counts are special, because they always return a number related to the number of solutions.
+						// which in the empty case should be 0. So we should never accept a value here.
+						// Even in the case that the Count is of a constant value.
+						predicates.add(ALWAYS_FALSE_VALUE);
+					} else {
+						predicates.add(ALWAYS_TRUE_VALUE);
+					}
 				}
 				final Entry entry = new Entry(null, collectors, predicates);
 				entry.addSolution(EmptyBindingSet.getInstance(), aggregates);
@@ -379,6 +402,7 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 
 	private static final Predicate<BindingSet> ALWAYS_TRUE_BINDING_SET = t -> true;
 	private static final Predicate<Value> ALWAYS_TRUE_VALUE = t -> true;
+	private static final Predicate<Value> ALWAYS_FALSE_VALUE = t -> false;
 	private static final Supplier<Predicate<Value>> ALWAYS_TRUE_VALUE_SUPPLIER = () -> ALWAYS_TRUE_VALUE;
 
 	private AggregatePredicateCollectorSupplier<?, ?> create(GroupElem ge, ValueFactory vf)
@@ -393,40 +417,33 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 				return new AggregatePredicateCollectorSupplier<>(wildCardCountAggregate, potentialDistinctTest,
 						() -> new CountCollector(vf), ge.getName());
 			} else {
-				QueryStepEvaluator f = new QueryStepEvaluator(
-						strategy.precompile(((Count) operator).getArg(), context));
+				QueryStepEvaluator f = precompileArg(operator);
 				CountAggregate agg = new CountAggregate(f);
-				Supplier<Predicate<Value>> predicate = operator.isDistinct() ? DistinctValues::new
-						: ALWAYS_TRUE_VALUE_SUPPLIER;
+				Supplier<Predicate<Value>> predicate = createDistinctValueTest(operator);
 				return new AggregatePredicateCollectorSupplier<>(agg, predicate, () -> new CountCollector(vf),
 						ge.getName());
 			}
 		} else if (operator instanceof Min) {
 			MinAggregate agg = new MinAggregate(precompileArg(operator), shouldValueComparisonBeStrict());
-			Supplier<Predicate<Value>> predicate = operator.isDistinct() ? DistinctValues::new
-					: ALWAYS_TRUE_VALUE_SUPPLIER;
+			Supplier<Predicate<Value>> predicate = createDistinctValueTest(operator);
 			return new AggregatePredicateCollectorSupplier<>(agg, predicate, ValueCollector::new, ge.getName());
 		} else if (operator instanceof Max) {
 			MaxAggregate agg = new MaxAggregate(precompileArg(operator), shouldValueComparisonBeStrict());
-			Supplier<Predicate<Value>> predicate = operator.isDistinct() ? DistinctValues::new
-					: ALWAYS_TRUE_VALUE_SUPPLIER;
+			Supplier<Predicate<Value>> predicate = createDistinctValueTest(operator);
 			return new AggregatePredicateCollectorSupplier<>(agg, predicate, ValueCollector::new, ge.getName());
 		} else if (operator instanceof Sum) {
 
 			SumAggregate agg = new SumAggregate(precompileArg(operator));
-			Supplier<Predicate<Value>> predicate = operator.isDistinct() ? DistinctValues::new
-					: ALWAYS_TRUE_VALUE_SUPPLIER;
+			Supplier<Predicate<Value>> predicate = createDistinctValueTest(operator);
 			return new AggregatePredicateCollectorSupplier<>(agg, predicate, () -> new IntegerCollector(vf),
 					ge.getName());
 		} else if (operator instanceof Avg) {
 			AvgAggregate agg = new AvgAggregate(precompileArg(operator));
-			Supplier<Predicate<Value>> predicate = operator.isDistinct() ? DistinctValues::new
-					: ALWAYS_TRUE_VALUE_SUPPLIER;
+			Supplier<Predicate<Value>> predicate = createDistinctValueTest(operator);
 			return new AggregatePredicateCollectorSupplier<>(agg, predicate, () -> new AvgCollector(vf), ge.getName());
 		} else if (operator instanceof Sample) {
 			SampleAggregate agg = new SampleAggregate(precompileArg(operator));
-			Supplier<Predicate<Value>> predicate = operator.isDistinct() ? DistinctValues::new
-					: ALWAYS_TRUE_VALUE_SUPPLIER;
+			Supplier<Predicate<Value>> predicate = createDistinctValueTest(operator);
 			return new AggregatePredicateCollectorSupplier<>(agg, predicate, SampleCollector::new, ge.getName());
 		} else if (operator instanceof GroupConcat) {
 			ValueExpr separatorExpr = ((GroupConcat) operator).getSeparator();
@@ -437,19 +454,17 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 			} else {
 				agg = new ConcatAggregate(precompileArg(operator));
 			}
-			Supplier<Predicate<Value>> predicate = operator.isDistinct() ? DistinctValues::new
-					: ALWAYS_TRUE_VALUE_SUPPLIER;
+			Supplier<Predicate<Value>> predicate = createDistinctValueTest(operator);
 			return new AggregatePredicateCollectorSupplier<>(agg, predicate, () -> new StringBuilderCollector(vf),
 					ge.getName());
 		} else if (operator instanceof AggregateFunctionCall) {
 			var aggOperator = (AggregateFunctionCall) operator;
-			Supplier<Predicate<Value>> predicate = operator.isDistinct() ? DistinctValues::new
-					: ALWAYS_TRUE_VALUE_SUPPLIER;
+			Supplier<Predicate<Value>> predicate = createDistinctValueTest(operator);
 			var factory = CustomAggregateFunctionRegistry.getInstance().get(aggOperator.getIRI());
 
 			var function = factory.orElseThrow(
 					() -> new QueryEvaluationException("Unknown aggregate function '" + aggOperator.getIRI() + "'"))
-					.buildFunction(new QueryStepEvaluator(strategy.precompile(aggOperator.getArg(), context)));
+					.buildFunction(precompileArg(aggOperator));
 			return new AggregatePredicateCollectorSupplier<>(function, predicate, () -> factory.get().getCollector(),
 					ge.getName());
 
@@ -458,8 +473,21 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 		return null;
 	}
 
+	/**
+	 * Create a predicate that tests if the value is distinct (returning true if the value was not seen yet), or always
+	 * returns true if the operator is not distinct.
+	 *
+	 * @param operator
+	 * @return a supplier that returns a predicate that tests if the value is distinct, or always returns true if the
+	 *         operator is not distinct.
+	 */
+	private Supplier<Predicate<Value>> createDistinctValueTest(AggregateOperator operator) {
+		return operator.isDistinct() ? DistinctValues::new : ALWAYS_TRUE_VALUE_SUPPLIER;
+	}
+
 	private QueryStepEvaluator precompileArg(AggregateOperator operator) {
-		return new QueryStepEvaluator(strategy.precompile(((UnaryValueOperator) operator).getArg(), context));
+		ValueExpr ve = ((UnaryValueOperator) operator).getArg();
+		return new QueryStepEvaluator(strategy.precompile(ve, context));
 	}
 
 	private boolean shouldValueComparisonBeStrict() {
@@ -477,7 +505,7 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 
 		@Override
 		public Value getFinalValue() {
-			return SimpleValueFactory.getInstance().createLiteral(Long.toString(value), CoreDatatype.XSD.INTEGER);
+			return vf.createLiteral(value, CoreDatatype.XSD.INTEGER);
 		}
 	}
 
@@ -547,7 +575,7 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 			}
 
 			if (count == 0) {
-				return SimpleValueFactory.getInstance().createLiteral("0", CoreDatatype.XSD.INTEGER);
+				return vf.createLiteral("0", CoreDatatype.XSD.INTEGER);
 			}
 
 			Literal sizeLit = SimpleValueFactory.getInstance().createLiteral(count);
@@ -777,9 +805,9 @@ public class GroupIterator extends AbstractCloseableIteratorIteration<BindingSet
 		@Override
 		public Value getFinalValue() throws ValueExprEvaluationException {
 			if (concatenated == null || concatenated.length() == 0) {
-				return SimpleValueFactory.getInstance().createLiteral("");
+				return vf.createLiteral("");
 			}
-			return SimpleValueFactory.getInstance().createLiteral(concatenated.toString());
+			return vf.createLiteral(concatenated.toString());
 		}
 	}
 

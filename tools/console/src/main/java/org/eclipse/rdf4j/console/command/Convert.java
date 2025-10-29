@@ -11,7 +11,7 @@
 package org.eclipse.rdf4j.console.command;
 
 import java.io.BufferedInputStream;
-import java.io.BufferedWriter;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -104,7 +104,7 @@ public class Convert extends ConsoleCommand {
 			return;
 		}
 		Optional<RDFFormat> fmtFrom = Rio.getParserFormatForFileName(fileFrom);
-		if (!fmtFrom.isPresent()) {
+		if (fmtFrom.isEmpty()) {
 			writeError("No RDF parser for " + fileFrom);
 			return;
 		}
@@ -116,7 +116,7 @@ public class Convert extends ConsoleCommand {
 			return;
 		}
 		Optional<RDFFormat> fmtTo = Rio.getWriterFormatForFileName(fileTo);
-		if (!fmtTo.isPresent()) {
+		if (fmtTo.isEmpty()) {
 			writeError("No RDF writer for " + fileTo);
 			return;
 		}
@@ -132,7 +132,7 @@ public class Convert extends ConsoleCommand {
 		String baseURI = pathFrom.toUri().toString();
 
 		try (BufferedInputStream r = new BufferedInputStream(Files.newInputStream(pathFrom));
-				BufferedWriter w = Files.newBufferedWriter(pathTo)) {
+				BufferedOutputStream w = new BufferedOutputStream(Files.newOutputStream(pathTo))) {
 			RDFWriter writer = Rio.createWriter(fmtTo.get(), w);
 			parser.setRDFHandler(writer);
 
@@ -140,6 +140,8 @@ public class Convert extends ConsoleCommand {
 			writeln("Converting file ...");
 
 			parser.parse(r, baseURI);
+
+			w.flush();
 
 			long diff = (System.nanoTime() - startTime) / 1_000_000;
 			writeln("Data has been written to file (" + diff + " ms)");

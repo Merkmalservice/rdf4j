@@ -56,7 +56,7 @@ public class ConjunctiveConstraintSplitterOptimizer implements QueryOptimizer {
 			TupleExpr filterArg = filter.getArg();
 
 			for (int i = conjunctiveConstraints.size() - 1; i >= 1; i--) {
-				Filter newFilter = new Filter(filterArg, conjunctiveConstraints.get(i));
+				Filter newFilter = new Filter(filterArg, conjunctiveConstraints.get(i).clone());
 				filterArg = newFilter;
 			}
 
@@ -69,7 +69,7 @@ public class ConjunctiveConstraintSplitterOptimizer implements QueryOptimizer {
 			super.meet(node);
 
 			if (node.getCondition() != null) {
-				List<ValueExpr> conjunctiveConstraints = new ArrayList<>(16);
+				List<ValueExpr> conjunctiveConstraints = new ArrayList<>();
 				getConjunctiveConstraints(node.getCondition(), conjunctiveConstraints);
 
 				TupleExpr arg = node.getRightArg();
@@ -77,11 +77,11 @@ public class ConjunctiveConstraintSplitterOptimizer implements QueryOptimizer {
 
 				for (ValueExpr constraint : conjunctiveConstraints) {
 					if (isWithinBindingScope(constraint, arg)) {
-						arg = new Filter(arg, constraint);
+						arg = new Filter(arg, constraint.clone());
 					} else if (condition == null) {
 						condition = constraint;
 					} else {
-						condition = new And(condition, constraint);
+						condition = new And(condition, constraint.clone());
 					}
 				}
 

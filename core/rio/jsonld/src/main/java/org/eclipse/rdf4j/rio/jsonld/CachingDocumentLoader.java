@@ -37,7 +37,7 @@ public class CachingDocumentLoader implements DocumentLoader {
 	private static final LoadingCache<URI, Document> cache = CacheBuilder.newBuilder()
 			.maximumSize(1000) // Maximum 1000 documents in cache
 			.expireAfterWrite(1, TimeUnit.HOURS) // Expire after 1 hour
-			.concurrencyLevel(8) // Optimize for 8 concurrent threads
+			.concurrencyLevel(Runtime.getRuntime().availableProcessors())
 			.build(new CacheLoader<>() {
 				@Override
 				public Document load(URI url) throws Exception {
@@ -78,7 +78,7 @@ public class CachingDocumentLoader implements DocumentLoader {
 				}
 			} else {
 				throw new RDFParseException("Could not load document from " + uri
-						+ " because it is not whitelisted. See: JSONLDSettings.WHITELIST and JSONLDSettings.SECURE_MODE");
+						+ " because it is not whitelisted. See: JSONLDSettings.WHITELIST and JSONLDSettings.SECURE_MODE which can also be set as system properties.");
 			}
 		} catch (RDFParseException e) {
 			logger.error(e.getMessage(), e);

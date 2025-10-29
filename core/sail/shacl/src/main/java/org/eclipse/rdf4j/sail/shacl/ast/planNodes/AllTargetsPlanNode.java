@@ -71,8 +71,9 @@ public class AllTargetsPlanNode implements PlanNode {
 
 			@Override
 			public void localClose() {
-				if (iterator != null)
+				if (iterator != null) {
 					iterator.close();
+				}
 			}
 
 			@Override
@@ -82,6 +83,10 @@ public class AllTargetsPlanNode implements PlanNode {
 
 			@Override
 			protected boolean localHasNext() {
+				if (Thread.currentThread().isInterrupted()) {
+					close();
+					return false;
+				}
 				return iterator.hasNext();
 			}
 		};
